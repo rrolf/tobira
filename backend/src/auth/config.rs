@@ -72,6 +72,9 @@ pub(crate) struct AuthConfig {
 
     #[config(nested)]
     pub(crate) oidc: OidcConfig,
+
+    #[config(nested)]
+    pub(crate) lti: LtiConfig,
 }
 
 impl AuthConfig {
@@ -114,17 +117,26 @@ impl AuthConfig {
                 'auth.callback.relevant_cookies'. But it is set.");
         }
 
-        let session_sources_defined = false
+        // Session sources configured via the built-in `[auth.session]` handlers.
+        // These are mutually exclusive with a non-`tobira-session` auth source.
+        let session_handlers_defined = false
             || self.session.from_login_credentials != LoginCredentialsHandler::None
             || self.session.from_session_endpoint != SessionEndpointHandler::None;
+        // OIDC and LTI also create Tobira sessions (both call
+        // `create_session_with_cookies`), so enabling either is another valid
+        // way to create sessions when `auth.source = "tobira-session"`.
+        let can_create_sessions = session_handlers_defined
+            || self.oidc.enabled
+            || self.lti.enabled;
         if self.source == AuthSource::TobiraSession {
-            if !session_sources_defined {
+            if !can_create_sessions {
                 bail!("'auth.source' is 'tobira-session', but no way to create \
-                    sessions is configured: set 'auth.session.from_login_credentials' \
-                    or 'auth.session.from_session_endpoint'");
+                    sessions is configured: enable 'auth.oidc' or 'auth.lti', or set \
+                    'auth.session.from_login_credentials' or \
+                    'auth.session.from_session_endpoint'");
             }
         } else {
-            if session_sources_defined {
+            if session_handlers_defined {
                 bail!("'auth.source' is not 'tobira-session', but \
                     'auth.session.from_login_credentials' or \
                     'auth.session.from_session_endpoint' is set.");
@@ -478,5 +490,208 @@ impl OidcConfig {
         }
 
         Ok(())
+    }
+}
+
+
+/// LTI 1.3 configuration. Tobira can act as an LTI 1.3 tool that LMS platforms
+/// (e.g. Moodle, Canvas) launch. LTI runs *alongside* the normal login, not as a
+/// replacement for it. See `docs/docs/dev/rfc-lti-1.3.md`.
+#[derive(Debug, Clone, confique::Config)]
+#[config(validate = Self::validate)]
+pub(crate) struct LtiConfig {
+    /// If `true`, the LTI launch endpoints are enabled.
+    #[config(default = false)]
+    pub(crate) enabled: bool,
+
+    /// Registered LTI platforms, one table entry per platform/deployment. All
+    /// values come from the tool registration in your LMS, which labels them
+    /// differently than the spec terms used here (Moodle labels shown; Canvas
+    /// calls `issuer` "Issuer"):
+    ///
+    ///     issuer         ->  "Platform ID"
+    ///     client_id      ->  "Client ID"
+    ///     deployment_id  ->  "Deployment ID"
+    ///     auth_login_url ->  "Authentication request URL"
+    ///     keyset_url     ->  "Public keyset URL"
+    ///
+    ///     [[auth.lti.platforms]]
+    ///     issuer = "https://moodle.example.org"
+    ///     client_id = "AbCd1234"
+    ///     deployment_id = "1"
+    ///     auth_login_url = "https://moodle.example.org/mod/lti/auth.php"
+    ///     keyset_url = "https://moodle.example.org/mod/lti/certs.php"
+    ///     # Moodle sends no `preferred_username`; take it from a custom parameter
+    ///     # (`username=$User.username`). See `username_source` for the caveat.
+    ///     username_source = "custom"
+    #[config(default = [])]
+    pub(crate) platforms: Vec<LtiPlatform>,
+}
+
+impl LtiConfig {
+    fn validate(&self) -> Result<()> {
+        if self.enabled {
+            anyhow::ensure!(
+                !self.platforms.is_empty(),
+                "auth.lti.enabled = true, but no '[[auth.lti.platforms]]' are configured",
+            );
+        }
+
+        // Platform URLs must be secure (https) and fragment-free, like all other
+        // externally-facing URLs in Tobira.
+        for platform in &self.platforms {
+            platform.auth_login_url.ensure_secure_no_fragment()?;
+            platform.keyset_url.ensure_secure_no_fragment()?;
+        }
+
+        Ok(())
+    }
+
+    /// Looks up a registered platform by the `(issuer, client_id)` pair, which
+    /// uniquely identifies an LTI registration. Returns `None` if no such
+    /// platform is configured. The LTI launch handler uses this to resolve the
+    /// platform a launch originated from.
+    pub(crate) fn find_platform(&self, issuer: &str, client_id: &str) -> Option<&LtiPlatform> {
+        self.platforms.iter()
+            .find(|p| p.issuer == issuer && p.client_id == client_id)
+    }
+
+    /// Looks up a platform by issuer alone — used when the login initiation does
+    /// not carry a `client_id`. Returns the first platform with that issuer.
+    pub(crate) fn find_platform_by_issuer(&self, issuer: &str) -> Option<&LtiPlatform> {
+        self.platforms.iter().find(|p| p.issuer == issuer)
+    }
+}
+
+/// A single registered LTI platform (i.e. an LMS).
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub(crate) struct LtiPlatform {
+    /// The platform's issuer identifier; compared **verbatim** against the `iss`
+    /// claim of launches. LTI issuers are exact-match identifiers, not URLs we
+    /// dereference, so this is a plain string (no URL normalization).
+    ///
+    /// In the LMS this is the field labelled "Platform ID" (Moodle) or
+    /// "Issuer" (Canvas).
+    pub(crate) issuer: String,
+
+    /// The client ID Tobira is registered under with this platform; matches the
+    /// `aud`/`azp` claim of launches. LMS label: "Client ID".
+    pub(crate) client_id: String,
+
+    /// The deployment ID; matches the platform's `deployment_id` claim.
+    /// LMS label: "Deployment ID".
+    pub(crate) deployment_id: String,
+
+    /// The platform's OIDC authorization endpoint that the login initiation
+    /// redirects to. LMS label: "Authentication request URL" (Moodle) /
+    /// "OpenID Connect Authentication URL"; for Moodle this is `.../mod/lti/auth.php`.
+    pub(crate) auth_login_url: HttpUrl,
+
+    /// The platform's JWKS URL, used to verify incoming launch tokens. LMS
+    /// label: "Public keyset URL"; for Moodle this is `.../mod/lti/certs.php`.
+    pub(crate) keyset_url: HttpUrl,
+
+    /// Which launch claim provides the Opencast username. Defaults to the
+    /// platform-asserted `preferred_username` (`"preferred-username"`).
+    ///
+    /// Set this to `"custom"` only for platforms that do not send a usable
+    /// `preferred_username` (e.g. Moodle), where the username has to be passed
+    /// via a `username` custom parameter (`username=$User.username`). Be aware
+    /// that custom parameters can be set per placement, often by instructors —
+    /// so `"custom"` trusts whoever configures the launch to assert the
+    /// identity. Only enable it for platforms where that is acceptable.
+    ///
+    /// `"sub"` uses the raw subject claim (rarely a valid Opencast username).
+    #[serde(default)]
+    pub(crate) username_source: LtiUsernameSource,
+}
+
+/// Which launch claim a platform's Opencast username is taken from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum LtiUsernameSource {
+    /// The `preferred_username` claim (safe default: platform-asserted).
+    #[default]
+    PreferredUsername,
+    /// The raw `sub` claim.
+    Sub,
+    /// The `username` custom parameter. See the caveat on `username_source`.
+    Custom,
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn platform(issuer: &str, client_id: &str) -> LtiPlatform {
+        LtiPlatform {
+            issuer: issuer.into(),
+            client_id: client_id.into(),
+            deployment_id: "1".into(),
+            auth_login_url: "https://lms.example.org/auth".parse().unwrap(),
+            keyset_url: "https://lms.example.org/jwks".parse().unwrap(),
+            username_source: LtiUsernameSource::default(),
+        }
+    }
+
+    fn lti_config(enabled: bool, platforms: Vec<LtiPlatform>) -> LtiConfig {
+        LtiConfig { enabled, platforms }
+    }
+
+    #[test]
+    fn find_platform_matches_on_issuer_and_client_id() {
+        let cfg = lti_config(true, vec![
+            platform("https://moodle.example.org", "client-a"),
+            platform("https://canvas.example.org", "client-b"),
+        ]);
+
+        assert_eq!(
+            cfg.find_platform("https://canvas.example.org", "client-b")
+                .map(|p| p.client_id.as_str()),
+            Some("client-b"),
+        );
+        // Right issuer but wrong client ID must not match.
+        assert!(cfg.find_platform("https://moodle.example.org", "client-b").is_none());
+        // Unknown issuer must not match.
+        assert!(cfg.find_platform("https://unknown.example.org", "client-a").is_none());
+    }
+
+    #[test]
+    fn validate_requires_platforms_when_enabled() {
+        assert!(lti_config(true, vec![]).validate().is_err());
+        assert!(lti_config(false, vec![]).validate().is_ok());
+        assert!(lti_config(true, vec![platform("https://moodle.example.org", "c")])
+            .validate().is_ok());
+    }
+
+    /// A full `AuthConfig` with every field at its default value.
+    fn default_auth_config() -> AuthConfig {
+        use confique::{Config, Layer};
+        let layer = <<AuthConfig as Config>::Layer as Layer>::default_values();
+        AuthConfig::from_layer(layer).expect("default AuthConfig should be valid")
+    }
+
+    #[test]
+    fn tobira_session_needs_a_session_source() {
+        // `tobira-session` without any way to create sessions must be rejected.
+        let mut cfg = default_auth_config();
+        cfg.source = AuthSource::TobiraSession;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn oidc_and_lti_count_as_session_sources() {
+        // Enabling OIDC alone is a valid way to create sessions.
+        let mut cfg = default_auth_config();
+        cfg.source = AuthSource::TobiraSession;
+        cfg.oidc.enabled = true;
+        assert!(cfg.validate().is_ok());
+
+        // Enabling LTI alone is a valid way to create sessions.
+        let mut cfg = default_auth_config();
+        cfg.source = AuthSource::TobiraSession;
+        cfg.lti.enabled = true;
+        assert!(cfg.validate().is_ok());
     }
 }
