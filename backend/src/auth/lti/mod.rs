@@ -664,8 +664,19 @@ mod tests {
 
     #[test]
     fn tool_key_loads_from_pem_and_rejects_garbage() {
-        // A throwaway RSA key generated purely as a test fixture.
-        let key = LtiToolKey::from_pem(include_bytes!("lti-test-key.pem")).unwrap();
+        use aws_lc_rs::encoding::{AsDer, Pkcs8V1Der};
+
+        // Round-trip a freshly generated key through PEM, the same shape an
+        // operator's openssl-generated `auth.lti.tool_key` file would have.
+        let generated = KeyPair::generate(KeySize::Rsa2048).unwrap();
+        let der = AsDer::<Pkcs8V1Der>::as_der(&generated).unwrap();
+        let pem = pem_rfc7468::encode_string(
+            "PRIVATE KEY",
+            pem_rfc7468::LineEnding::LF,
+            der.as_ref(),
+        ).unwrap();
+
+        let key = LtiToolKey::from_pem(pem.as_bytes()).unwrap();
         assert!(!key.ephemeral);
         // The JWKS must describe the loaded key, same shape as a generated one.
         let doc: serde_json::Value = serde_json::from_str(&key.jwks).unwrap();
