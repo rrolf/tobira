@@ -11,12 +11,13 @@ use std::{borrow::Cow, collections::BTreeMap};
 use aws_lc_rs::{digest, rsa::{KeyPair, KeySize}, signature::KeyPair as _};
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use hyper::{Method, Request, StatusCode, Uri, body::Incoming, header};
-use once_cell::sync::Lazy;
 use secrecy::ExposeSecret;
+
+pub(crate) mod deeplink;
 use serde::Deserialize;
 
 use crate::{
-    auth::{User, config::{LtiPlatform, LtiUsernameSource}},
+    auth::{User, config::{LtiConfig, LtiPlatform, LtiUsernameSource}},
     http::{self, Context, Response},
     prelude::*,
     sync::client::AuthMode,
@@ -212,6 +213,28 @@ pub(crate) async fn handle_launch(req: Request<Incoming>, ctx: &Context) -> Resp
 
     debug!("LTI launch claims: {claims:#?}");
 
+    // ----- Dispatch on the message type ------------------------------------------------------
+    // Unknown types are rejected before the expensive user resolution; Deep
+    // Linking requests additionally need valid settings, checked here so a
+    // broken request fails before a session is created.
+    let kind = match launch_kind(&claims) {
+        Some(kind) => kind,
+        None => {
+            let ty = claims.message_type.as_deref().unwrap_or("<absent>");
+            warn!("LTI launch with unsupported message_type '{ty}'");
+            return http::response::bad_request("LTI launch: unsupported message type");
+        }
+    };
+    let deep_linking_settings = match kind {
+        LaunchKind::ResourceLink => None,
+        LaunchKind::DeepLinking => {
+            match deeplink::validated_settings(&claims) {
+                Ok(settings) => Some(settings),
+                Err(response) => return response,
+            }
+        }
+    };
+
     // ----- Build the user and create a session ----------------------------------------------
     // Roles come from Opencast, exactly like the OIDC login (#1706). The
     // username comes from the claim the platform is configured to use; see the
@@ -251,16 +274,22 @@ pub(crate) async fn handle_launch(req: Request<Incoming>, ctx: &Context) -> Resp
         Err(response) => return response,
     };
 
-    // Decide where to land: a Tobira series page if the placement carries a
-    // `series` custom parameter (an Opencast series ID), otherwise the
-    // platform's target_link_uri. Both are kept within Tobira (no open redirect).
-    let target = match claims.custom.as_ref()
+    // A Deep Linking launch continues into the selection flow instead of
+    // landing on content.
+    if let Some(settings) = deep_linking_settings {
+        return deeplink::start_selection(settings, platform, &cookie, ctx).await;
+    }
+
+    // Decide where to land; see `landing_target`. Both candidates are kept
+    // within Tobira (no open redirect).
+    let custom_series = claims.custom.as_ref()
         .and_then(|custom| custom.get("series"))
-        .and_then(|series| series.as_str())
-    {
-        Some(series) => series_landing(&ctx.config.general.tobira_url.to_string(), series),
-        None => safe_target(&login.target_link_uri, ctx),
-    };
+        .and_then(|series| series.as_str());
+    let target = landing_target(
+        &login.target_link_uri,
+        custom_series,
+        &ctx.config.general.tobira_url.to_string(),
+    );
     // `target` is constrained to our own origin, but a `series` custom parameter
     // could still carry characters that are invalid in a header; fall back to the
     // base URL rather than panic when building the response.
@@ -274,6 +303,27 @@ pub(crate) async fn handle_launch(req: Request<Incoming>, ctx: &Context) -> Resp
         .header(header::SET_COOKIE, cookie.to_string())
         .body(ByteBody::empty())
         .unwrap()
+}
+
+/// The kind of LTI message a launch carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchKind {
+    /// A regular content launch (`LtiResourceLinkRequest`).
+    ResourceLink,
+    /// A Deep Linking content selection request (`LtiDeepLinkingRequest`).
+    DeepLinking,
+}
+
+/// Classifies the launch by its `message_type` claim. An *absent* claim is
+/// treated as a resource link: the spec requires the claim, but being lenient
+/// here keeps already-working platform configurations working. Unknown types
+/// yield `None` and must be rejected.
+fn launch_kind(claims: &LtiClaims) -> Option<LaunchKind> {
+    match claims.message_type.as_deref() {
+        None | Some("LtiResourceLinkRequest") => Some(LaunchKind::ResourceLink),
+        Some("LtiDeepLinkingRequest") => Some(LaunchKind::DeepLinking),
+        Some(_) => None,
+    }
 }
 
 /// Determines the Opencast username from the launch claims, using the source
@@ -313,10 +363,23 @@ async fn fetch_platform_jwks(
     Ok(jwks.to_verifying_keys().filter_map(|res| res.ok()).collect())
 }
 
-/// Returns `target` if it points within our own Tobira instance, otherwise the
-/// Tobira base URL. Prevents the launch from being abused as an open redirect.
-fn safe_target(target: &str, ctx: &Context) -> String {
-    resolve_target(target, &ctx.config.general.tobira_url.to_string())
+/// Picks the page a resource-link launch lands on.
+///
+/// A specific `target_link_uri` wins: activities created via Deep Linking
+/// carry the picked page there. The `series` custom parameter is only the
+/// fallback for manually configured placements — it is typically set
+/// tool-wide, so it must not override a specific target (otherwise every
+/// launch of that tool would land on the same series, no matter what was
+/// picked). Without either, the launch lands on the start page.
+fn landing_target(target_link_uri: &str, custom_series: Option<&str>, base: &str) -> String {
+    let resolved = resolve_target(target_link_uri, base);
+    if resolved != base {
+        return resolved;
+    }
+    match custom_series {
+        Some(series) => series_landing(base, series),
+        None => resolved,
+    }
 }
 
 /// Picks a safe in-Tobira redirect target for a launch, defaulting to `base`
@@ -362,6 +425,14 @@ struct LtiClaims {
     name: Option<String>,
     preferred_username: Option<String>,
     email: Option<String>,
+
+    /// What kind of message this launch is (resource link, deep linking, …).
+    #[serde(rename = "https://purl.imsglobal.org/spec/lti/claim/message_type")]
+    message_type: Option<String>,
+
+    /// Settings of a Deep Linking request; only present on those.
+    #[serde(rename = "https://purl.imsglobal.org/spec/lti-dl/claim/deep_linking_settings")]
+    deep_linking_settings: Option<deeplink::DeepLinkingSettingsClaim>,
 
     #[serde(rename = "https://purl.imsglobal.org/spec/lti/claim/deployment_id")]
     deployment_id: String,
@@ -432,20 +503,54 @@ impl<H> jwtea::Validator<H, LtiClaims> for LtiLaunchValidator<'_> {
 /// (PEM) is a later enhancement — platforms re-fetch the keyset, so a fresh key
 /// across restarts is still valid, it just invalidates in-flight signed
 /// messages (of which the MVP has none).
-struct LtiToolKey {
-    /// Kept for signing the Deep Linking response / NRPS `client_assertion`
-    /// (added with those features).
-    #[allow(dead_code)]
+pub(crate) struct LtiToolKey {
+    /// Signs the Deep Linking response (and later the NRPS `client_assertion`).
     keypair: KeyPair,
 
     /// The public JWKS document served at `/~lti/jwks`.
     jwks: String,
+
+    /// The key id, included in headers of JWTs we sign so the platform picks
+    /// the right key from our JWKS.
+    kid: String,
+
+    /// Whether the key was generated for this process (no `auth.lti.tool_key`
+    /// configured). Signing with an ephemeral key gets a warning: with more
+    /// than one Tobira process, `/~lti/jwks` would serve a different key set
+    /// depending on which process answers, so verification can fail.
+    ephemeral: bool,
 }
 
 impl LtiToolKey {
+    /// Loads the key from `auth.lti.tool_key` (a PEM PKCS#8 RSA private key),
+    /// or generates a fresh one per process if the option is not set —
+    /// mirroring how `auth.jwt.secret_key` behaves.
+    pub(crate) fn load(config: &LtiConfig) -> Result<Self> {
+        let Some(path) = &config.tool_key else {
+            return Ok(Self::generate());
+        };
+
+        let pem = std::fs::read(path)
+            .with_context(|| format!("failed to read `auth.lti.tool_key` file '{}'",
+                path.display()))?;
+        Self::from_pem(&pem)
+    }
+
+    fn from_pem(pem: &[u8]) -> Result<Self> {
+        let (_label, pkcs8) = pem_rfc7468::decode_vec(pem)
+            .context("`auth.lti.tool_key` is not a valid PEM document")?;
+        let keypair = KeyPair::from_pkcs8(&pkcs8)
+            .map_err(|e| anyhow!("`auth.lti.tool_key` is not a valid RSA key: {e}"))?;
+        Ok(Self::from_keypair(keypair, false))
+    }
+
     fn generate() -> Self {
         let keypair = KeyPair::generate(KeySize::Rsa2048)
             .expect("failed to generate LTI tool RSA key");
+        Self::from_keypair(keypair, true)
+    }
+
+    fn from_keypair(keypair: KeyPair, ephemeral: bool) -> Self {
         let public = keypair.public_key();
 
         // JWK RSA components: base64url(big-endian modulus / exponent).
@@ -467,11 +572,38 @@ impl LtiToolKey {
             }],
         }).to_string();
 
-        Self { keypair, jwks }
+        Self { keypair, jwks, kid, ephemeral }
+    }
+
+    /// Signs `payload` as an RS256 JWT with this key. The platform verifies
+    /// the signature against `/~lti/jwks`.
+    pub(super) fn sign_jwt(&self, payload: &serde_json::Value) -> String {
+        if self.ephemeral {
+            warn!("Signing an LTI JWT with an ephemeral tool key. Set `auth.lti.tool_key` \
+                so signatures stay verifiable across restarts and processes.");
+        }
+
+        let header = serde_json::json!({ "alg": "RS256", "typ": "JWT", "kid": self.kid });
+        let mut jwt = format!(
+            "{}.{}",
+            BASE64_URL_SAFE_NO_PAD.encode(header.to_string()),
+            BASE64_URL_SAFE_NO_PAD.encode(payload.to_string()),
+        );
+
+        let mut signature = vec![0; self.keypair.public_modulus_len()];
+        self.keypair
+            .sign(
+                &aws_lc_rs::signature::RSA_PKCS1_SHA256,
+                &aws_lc_rs::rand::SystemRandom::new(),
+                jwt.as_bytes(),
+                &mut signature,
+            )
+            .expect("failed to RS256-sign LTI JWT");
+        jwt.push('.');
+        jwt.push_str(&BASE64_URL_SAFE_NO_PAD.encode(&signature));
+        jwt
     }
 }
-
-static LTI_TOOL_KEY: Lazy<LtiToolKey> = Lazy::new(LtiToolKey::generate);
 
 /// Handles `GET /~lti/jwks`: serves the tool's public keys (JWKS) so platforms
 /// can register Tobira and verify JWTs it signs (Deep Linking response, service
@@ -482,7 +614,7 @@ pub(crate) async fn handle_jwks(ctx: &Context) -> Response {
     }
     Response::builder()
         .header(header::CONTENT_TYPE, "application/json")
-        .body(ByteBody::new(LTI_TOOL_KEY.jwks.clone().into()))
+        .body(ByteBody::new(ctx.lti_tool_key.jwks.clone().into()))
         .unwrap()
 }
 
@@ -528,6 +660,114 @@ mod tests {
         base.extend(extra);
 
         serde_json::from_value(json).expect("claims should deserialize")
+    }
+
+    #[test]
+    fn tool_key_loads_from_pem_and_rejects_garbage() {
+        use aws_lc_rs::encoding::{AsDer, Pkcs8V1Der};
+
+        // Round-trip a freshly generated key through PEM, the same shape an
+        // operator's openssl-generated `auth.lti.tool_key` file would have.
+        let generated = KeyPair::generate(KeySize::Rsa2048).unwrap();
+        let der = AsDer::<Pkcs8V1Der>::as_der(&generated).unwrap();
+        let pem = pem_rfc7468::encode_string(
+            "PRIVATE KEY",
+            pem_rfc7468::LineEnding::LF,
+            der.as_ref(),
+        ).unwrap();
+
+        let key = LtiToolKey::from_pem(pem.as_bytes()).unwrap();
+        assert!(!key.ephemeral);
+        // The JWKS must describe the loaded key, same shape as a generated one.
+        let doc: serde_json::Value = serde_json::from_str(&key.jwks).unwrap();
+        assert_eq!(doc["keys"][0]["kty"], "RSA");
+        assert!(doc["keys"][0]["n"].as_str().unwrap().len() > 300);
+
+        assert!(LtiToolKey::from_pem(b"not a pem").is_err());
+        assert!(LtiToolKey::generate().ephemeral);
+    }
+
+    /// The round trip a platform performs: our signed JWT must verify against
+    /// our own published JWKS, using the same verification code (`jwtea`)
+    /// that we use for incoming tokens.
+    #[tokio::test]
+    async fn signed_jwt_verifies_against_own_jwks() {
+        let key = LtiToolKey::generate();
+        let now = chrono::Utc::now().timestamp();
+        let jwt = key.sign_jwt(&serde_json::json!({ "exp": now + 60, "answer": 42 }));
+
+        let jwks: jwtea::Jwks = serde_json::from_str(&key.jwks).unwrap();
+        let keys: Vec<_> = jwks.to_verifying_keys().filter_map(|k| k.ok()).collect();
+        assert!(!keys.is_empty());
+
+        let validator = jwtea::BasicValidator { allowed_clock_skew: 10 };
+        let claims = jwtea::RawJwt::new(jwt).unwrap()
+            .decode::<(), serde_json::Value, _>(
+                keys.as_slice(),
+                &validator,
+                |_header, payload| payload.extra_fields,
+            )
+            .await
+            .expect("own JWT must verify against own JWKS");
+        assert_eq!(claims["answer"], 42);
+
+        // A signature from a *different* key must be rejected.
+        let other = LtiToolKey::generate();
+        let forged = other.sign_jwt(&serde_json::json!({ "exp": now + 60 }));
+        assert!(jwtea::RawJwt::new(forged).unwrap()
+            .decode::<(), serde_json::Value, _>(
+                keys.as_slice(),
+                &validator,
+                |_header, payload| payload.extra_fields,
+            )
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn launch_kind_classifies_message_types() {
+        let with_type = |ty: &str| claims_with(serde_json::json!({
+            "https://purl.imsglobal.org/spec/lti/claim/message_type": ty,
+        }));
+
+        // Absent is treated as a resource link (leniency for existing setups).
+        assert_eq!(
+            launch_kind(&claims_with(serde_json::json!({}))),
+            Some(LaunchKind::ResourceLink),
+        );
+        assert_eq!(
+            launch_kind(&with_type("LtiResourceLinkRequest")),
+            Some(LaunchKind::ResourceLink),
+        );
+        assert_eq!(
+            launch_kind(&with_type("LtiDeepLinkingRequest")),
+            Some(LaunchKind::DeepLinking),
+        );
+        // Unknown types must be rejected by the caller.
+        assert_eq!(launch_kind(&with_type("LtiSubmissionReviewRequest")), None);
+    }
+
+    #[test]
+    fn landing_prefers_specific_target_over_series_parameter() {
+        let base = "https://tobira.example.org";
+
+        // A Deep-Linking-created activity: its target names the picked page,
+        // and a tool-wide `series` parameter must NOT override it.
+        assert_eq!(
+            landing_target("https://tobira.example.org/!s/:picked", Some("toolwide"), base),
+            "https://tobira.example.org/!s/:picked",
+        );
+        // Manually configured placement: target is just the tool URL, so the
+        // `series` parameter decides the landing.
+        assert_eq!(
+            landing_target("https://tobira.example.org/~lti/launch", Some("toolwide"), base),
+            "https://tobira.example.org/!s/:toolwide",
+        );
+        // Neither: start page.
+        assert_eq!(
+            landing_target("https://tobira.example.org/~lti/launch", None, base),
+            base,
+        );
     }
 
     #[test]
