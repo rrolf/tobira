@@ -4,6 +4,7 @@ use self::util::TestDb;
 
 mod util;
 mod search_queue;
+mod lti_registrations;
 
 
 #[tokio::test(flavor = "multi_thread")]
