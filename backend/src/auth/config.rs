@@ -629,6 +629,19 @@ pub(crate) enum LtiUsernameSource {
     Custom,
 }
 
+impl LtiUsernameSource {
+    /// Parses the kebab-case form this type also uses in the config (stored
+    /// like that in the `lti_registrations` table).
+    pub(crate) fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "preferred-username" => Some(Self::PreferredUsername),
+            "sub" => Some(Self::Sub),
+            "custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
