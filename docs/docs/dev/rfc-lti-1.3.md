@@ -6,7 +6,7 @@ sidebar_position: 100
 
 | | |
 |---|---|
-| **Status** | Draft / for discussion. **LTI 1.3 Core and Deep Linking 2.0 are implemented** (see below); NRPS and Dynamic Registration are not. |
+| **Status** | Draft / for discussion. **LTI 1.3 Core, Deep Linking 2.0 and Dynamic Registration are implemented** (see below); NRPS is not. |
 | **Author** | rrolf@uni-osnabrück.de |
 | **Scope** | Backend (`backend/src/auth`), frontend (selection UI), docs |
 | **Target** | LTI 1.3 Core + Deep Linking 2.0 + NRPS 2.0 (LTI Advantage) |
