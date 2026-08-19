@@ -17,8 +17,8 @@ source = "tobira-session"
 ```
 
 :::note
-LTI support covers LTI 1.3 Core (launch + login) and [Deep Linking](#deep-linking)
-(content selection). Names & Role Provisioning (NRPS) and Dynamic Registration are **not**
+LTI support covers LTI 1.3 Core (launch + login), [Deep Linking](#deep-linking)
+(content selection) and Dynamic Registration. Names & Role Provisioning (NRPS) is **not**
 included yet. See [Known limitations](#known-limitations).
 :::
 
@@ -88,6 +88,46 @@ does not have this concern, because that claim is asserted by the platform.
 
 
 ## Configuration
+
+There are two ways to register a platform: **dynamically** (recommended — one URL, no
+field copying) or **manually** in the config file.
+
+### Dynamic Registration (one URL)
+
+Set a registration secret:
+
+```toml
+[auth.lti]
+enabled = true
+registration_secret = "…"    # long random value, e.g. `openssl rand -base64 24`
+```
+
+Then, in Moodle, paste this as the tool URL under *Site administration → Plugins →
+External tool → Manage tools → Add LTI Advantage*:
+
+```
+https://tobira.example.org/~lti/register?secret=<value>
+```
+
+The two systems negotiate everything else: Tobira registers its endpoints, Deep Linking
+support, **and the `username=$User.username` custom parameter** — the entire manual
+checklist below. Registering the same platform again simply updates it.
+
+Anyone who knows the secret can register a platform that can then launch users into
+Tobira — treat the URL accordingly, and rotate the secret by changing the option.
+Inspect and revoke registrations with:
+
+```shell
+tobira lti-registrations list
+tobira lti-registrations remove <issuer>
+```
+
+For dynamically registered platforms, Tobira accepts deployment IDs it has not seen
+before (they are logged and remembered): the registration covers the platform as a
+whole, and authenticity rests on the token signature either way. Statically configured
+platforms keep their pinned `deployment_id`.
+
+### Manual configuration
 
 Enable LTI and register each platform/deployment under `[auth.lti]`:
 
@@ -223,5 +263,4 @@ re-checked server-side on confirmation).
 
 - **New window only** — iframe embedding of *content* needs `SameSite=None` / Storage
   Access work. This is also why the Deep Linking selection bridges to a separate window.
-- **No NRPS or Dynamic Registration yet** — platforms must be registered manually, and
-  access control derives from the launch and Opencast alone.
+- **No NRPS yet** — access control derives from the launch and Opencast alone.
