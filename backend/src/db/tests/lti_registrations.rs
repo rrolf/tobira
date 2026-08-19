@@ -16,7 +16,7 @@ async fn insert_registration(db: &TestDb, issuer: &str, client_id: &str) -> Resu
 }
 
 fn config_with(platforms: Vec<LtiPlatform>) -> LtiConfig {
-    LtiConfig { enabled: true, platforms, tool_key: None }
+    LtiConfig { enabled: true, platforms, tool_key: None, registration_secret: None }
 }
 
 #[tokio::test(flavor = "multi_thread")]
