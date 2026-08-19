@@ -59,20 +59,13 @@ pub(crate) async fn handle_login(req: Request<Incoming>, ctx: &Context) -> Respo
     // Resolve the platform (static config first, then dynamic registrations).
     // `client_id` is optional in the initiation request: match on (iss,
     // client_id) if it is present, otherwise on the issuer alone.
-    let db = match crate::db::get_conn_or_service_unavailable(&ctx.db_pool).await {
-        Ok(db) => db,
-        Err(response) => return response,
-    };
-    let platform = match resolve_platform(&db, &ctx.config.auth.lti, iss, get("client_id")).await {
+    let platform = match resolve_platform(ctx, iss, get("client_id")).await {
         Ok(Some(platform)) => platform,
         Ok(None) => {
             warn!("LTI login for unknown platform (iss = '{iss}')");
             return http::response::bad_request("LTI login: unknown platform");
         }
-        Err(e) => {
-            error!("LTI login: platform lookup failed: {e:#}");
-            return http::response::internal_server_error();
-        }
+        Err(response) => return response,
     };
 
     // Issue `state` + `nonce` and remember them for the launch to verify.
@@ -172,26 +165,14 @@ pub(crate) async fn handle_launch(req: Request<Incoming>, ctx: &Context) -> Resp
         warn!("LTI launch with unknown, expired or already-used 'state'");
         return http::response::bad_request("LTI launch: invalid or expired 'state'");
     };
-    let db = match crate::db::get_conn_or_service_unavailable(&ctx.db_pool).await {
-        Ok(db) => db,
-        Err(response) => return response,
-    };
-    let platform = match resolve_platform(
-        &db,
-        &ctx.config.auth.lti,
-        &login.issuer,
-        Some(&login.client_id),
-    ).await {
+    let platform = match resolve_platform(ctx, &login.issuer, Some(&login.client_id)).await {
         Ok(Some(platform)) => platform,
         Ok(None) => {
             // The platform was removed between login and launch.
             error!("LTI launch: platform for issued state no longer known");
             return http::response::internal_server_error();
         }
-        Err(e) => {
-            error!("LTI launch: platform lookup failed: {e:#}");
-            return http::response::internal_server_error();
-        }
+        Err(response) => return response,
     };
 
     // ----- Verify the launch token against the platform's JWKS ------------------------------
@@ -248,11 +229,17 @@ pub(crate) async fn handle_launch(req: Request<Incoming>, ctx: &Context) -> Resp
                     "LTI launch: new deployment '{}' of registered platform '{}'",
                     claims.deployment_id, platform.issuer,
                 );
-                let remembered = registration::remember_deployment(
-                    &db, *registration_id, &claims.deployment_id,
-                ).await;
+                // Purely informational bookkeeping — don't fail the launch if
+                // the connection or the update fails.
+                let remembered = match crate::db::get_conn_or_service_unavailable(
+                    &ctx.db_pool,
+                ).await {
+                    Ok(db) => registration::remember_deployment(
+                        &db, *registration_id, &claims.deployment_id,
+                    ).await,
+                    Err(_) => Err(anyhow!("no DB connection")),
+                };
                 if let Err(e) = remembered {
-                    // Purely informational bookkeeping — don't fail the launch.
                     warn!("LTI launch: could not record deployment id: {e:#}");
                 }
             }
@@ -411,7 +398,9 @@ async fn fetch_platform_jwks(
     if !response.status().is_success() {
         bail!("platform JWKS endpoint returned status {}", response.status());
     }
-    let body = download_body(response.into_body()).await?;
+    // Cap the response size: with Dynamic Registration, the keyset URL is not
+    // necessarily admin-configured anymore.
+    let body = crate::util::download_body_limited(response.into_body(), 256 * 1024).await?;
     let jwks: jwtea::Jwks = serde_json::from_slice(&body)
         .context("could not parse platform JWKS")?;
     Ok(jwks.to_verifying_keys().filter_map(|res| res.ok()).collect())
