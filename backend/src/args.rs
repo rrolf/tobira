@@ -115,6 +115,16 @@ pub(crate) enum Command {
         shared: Shared,
     },
 
+    /// Managing dynamically registered LTI platforms (see the
+    /// `auth.lti.registration_secret` config option).
+    LtiRegistrations {
+        #[clap(subcommand)]
+        options: cmd::lti_registrations::Args,
+
+        #[clap(flatten)]
+        shared: Shared,
+    },
+
     /// Managing "known users". This data is only used for the ACL UI and not
     /// for auth at all!
     KnownUsers {
