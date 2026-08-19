@@ -10,11 +10,11 @@ use secrecy::ExposeSecret;
 use serde::Deserialize;
 
 use crate::{
-    auth::config::{LtiConfig, LtiPlatform, LtiUsernameSource},
+    auth::config::{LtiPlatform, LtiUsernameSource},
     db,
     http::{self, Context, Response},
     prelude::*,
-    util::{ByteBody, HttpUrl, download_body},
+    util::{ByteBody, HttpUrl, download_body_limited},
 };
 
 use super::deeplink::{html_escape, token_response};
@@ -62,13 +62,15 @@ impl ResolvedPlatform {
 
 /// Looks up the platform for `issuer` (and, if given, `client_id`): the static
 /// config wins, then dynamic registrations. `Ok(None)` means "unknown
-/// platform" and must be rejected by the caller.
+/// platform" and must be rejected by the caller. The DB is only consulted
+/// (and a connection only acquired) when the config has no match, so
+/// config-only deployments keep working without the DB.
 pub(crate) async fn resolve_platform(
-    db: &tokio_postgres::Client,
-    config: &LtiConfig,
+    ctx: &Context,
     issuer: &str,
     client_id: Option<&str>,
-) -> Result<Option<ResolvedPlatform>> {
+) -> Result<Option<ResolvedPlatform>, Response> {
+    let config = &ctx.config.auth.lti;
     let from_config = match client_id {
         Some(client_id) => config.find_platform(issuer, client_id),
         None => config.find_platform_by_issuer(issuer),
@@ -77,6 +79,19 @@ pub(crate) async fn resolve_platform(
         return Ok(Some(ResolvedPlatform::from_config(platform)));
     }
 
+    let db = db::get_conn_or_service_unavailable(&ctx.db_pool).await?;
+    find_registration(&db, issuer, client_id).await.map_err(|e| {
+        error!("LTI platform lookup failed: {e:#}");
+        http::response::internal_server_error()
+    })
+}
+
+/// The DB half of [`resolve_platform`]: looks up a dynamic registration.
+pub(crate) async fn find_registration(
+    db: &tokio_postgres::Client,
+    issuer: &str,
+    client_id: Option<&str>,
+) -> Result<Option<ResolvedPlatform>> {
     let row = db.query_opt(
         "select id, client_id, auth_login_url, keyset_url, deployment_ids, username_source \
             from lti_registrations \
@@ -224,11 +239,18 @@ impl PlatformConfig {
     }
 }
 
+/// Requires strict `https` — deliberately NOT `ensure_secure_no_fragment`,
+/// whose `#allow-insecure` escape hatch is meant for admin-*configured* URLs.
+/// Registration URLs come from the network.
+fn ensure_https(url: &HttpUrl, what: &str) -> Result<()> {
+    anyhow::ensure!(url.scheme() == "https", "{what} must be an https URL");
+    Ok(())
+}
+
 async fn fetch_platform_config(config_url: &str, ctx: &Context) -> Result<PlatformConfig> {
     let url: HttpUrl = config_url.parse()
         .map_err(|e| anyhow!("'openid_configuration' is not a valid URL: {e}"))?;
-    url.ensure_secure_no_fragment()
-        .map_err(|_| anyhow!("'openid_configuration' must be an https URL"))?;
+    ensure_https(&url, "'openid_configuration'")?;
 
     let uri = url.as_str().parse().context("unusable configuration URL")?;
     let response = ctx.http_client.get(uri).await
@@ -236,21 +258,20 @@ async fn fetch_platform_config(config_url: &str, ctx: &Context) -> Result<Platfo
     if !response.status().is_success() {
         bail!("platform configuration returned status {}", response.status());
     }
-    let body = download_body(response.into_body()).await
+    let body = download_body_limited(response.into_body(), CONFIG_SIZE_LIMIT).await
         .context("could not read platform configuration")?;
-    if body.len() > CONFIG_SIZE_LIMIT {
-        bail!("platform configuration is implausibly large");
-    }
     let platform: PlatformConfig = serde_json::from_slice(&body)
         .context("could not parse platform configuration")?;
 
+    // The issuer is pinned to the configuration URL's host. The three endpoint
+    // URLs inside the (issuer-pinned) document are checked for https only, not
+    // for their host: multi-host platforms exist, and whoever controls the
+    // issuer host could serve any content on it anyway — the secret holder is
+    // trusted to point Tobira at a real platform.
     check_issuer(&platform.issuer, &url)?;
-    platform.registration_endpoint.ensure_secure_no_fragment()
-        .map_err(|_| anyhow!("registration endpoint is not https"))?;
-    platform.jwks_uri.ensure_secure_no_fragment()
-        .map_err(|_| anyhow!("jwks_uri is not https"))?;
-    platform.authorization_endpoint.ensure_secure_no_fragment()
-        .map_err(|_| anyhow!("authorization endpoint is not https"))?;
+    ensure_https(&platform.registration_endpoint, "registration endpoint")?;
+    ensure_https(&platform.jwks_uri, "jwks_uri")?;
+    ensure_https(&platform.authorization_endpoint, "authorization endpoint")?;
 
     Ok(platform)
 }
@@ -328,7 +349,12 @@ async fn register_at_platform(
         .uri(platform.registration_endpoint.as_str())
         .header(header::CONTENT_TYPE, "application/json");
     if let Some(token) = registration_token {
-        request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        // The token comes from the query string; reject values that are not a
+        // valid header (e.g. embedded control characters) instead of panicking
+        // on `body()` below.
+        let value = header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| anyhow!("'registration_token' contains invalid characters"))?;
+        request = request.header(header::AUTHORIZATION, value);
     }
     let request = request
         .body(ByteBody::new(payload.to_string().into()))
@@ -337,7 +363,7 @@ async fn register_at_platform(
     let response = ctx.http_client.request(request).await
         .context("registration endpoint not reachable")?;
     let status = response.status();
-    let body = download_body(response.into_body()).await
+    let body = download_body_limited(response.into_body(), CONFIG_SIZE_LIMIT).await
         .context("could not read registration response")?;
     if !status.is_success() {
         bail!(
@@ -430,7 +456,8 @@ fn error_page(status: StatusCode, message: &str) -> Response {
         .unwrap()
 }
 
-/// Remembers a newly seen deployment ID of a dynamic registration.
+/// Remembers a newly seen deployment ID of a dynamic registration. Idempotent:
+/// concurrent first launches of the same deployment do not create duplicates.
 pub(crate) async fn remember_deployment(
     db: &tokio_postgres::Client,
     registration_id: i64,
@@ -439,7 +466,7 @@ pub(crate) async fn remember_deployment(
     db.execute(
         "update lti_registrations \
             set deployment_ids = array_append(deployment_ids, $2) \
-            where id = $1",
+            where id = $1 and not ($2 = any(deployment_ids))",
         &[&registration_id, &deployment_id],
     ).await.context("failed to record deployment id")?;
     Ok(())
@@ -468,6 +495,22 @@ mod tests {
             ]
         }
     }"#;
+
+    #[test]
+    fn from_config_pins_the_deployment_id() {
+        let platform = LtiPlatform {
+            issuer: "https://moodle.example.org".into(),
+            client_id: "from-config".into(),
+            deployment_id: "1".into(),
+            auth_login_url: "https://lms.example.org/auth".parse().unwrap(),
+            keyset_url: "https://lms.example.org/jwks".parse().unwrap(),
+            username_source: LtiUsernameSource::default(),
+        };
+        let resolved = ResolvedPlatform::from_config(&platform);
+        assert_eq!(resolved.client_id, "from-config");
+        assert_eq!(resolved.username_source, LtiUsernameSource::PreferredUsername);
+        assert!(matches!(resolved.deployments, DeploymentPolicy::Fixed(ref d) if d == "1"));
+    }
 
     #[test]
     fn platform_config_parses_and_issuer_check_works() {

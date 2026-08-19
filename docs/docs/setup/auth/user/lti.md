@@ -114,7 +114,9 @@ support, **and the `username=$User.username` custom parameter** — the entire m
 checklist below. Registering the same platform again simply updates it.
 
 Anyone who knows the secret can register a platform that can then launch users into
-Tobira — treat the URL accordingly, and rotate the secret by changing the option.
+Tobira — treat the URL accordingly, and rotate the secret by changing the option. Note
+that the secret travels as a URL parameter (that is how the LMS dialog works), so it will
+appear in reverse-proxy access logs.
 Inspect and revoke registrations with:
 
 ```shell
