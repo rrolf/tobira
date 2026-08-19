@@ -113,7 +113,7 @@ pub(super) async fn start_selection(
 /// A response builder for responses that carry the Deep Linking token (in the
 /// `Location` URL or as page content): the token must not leak via `Referer`
 /// or shared caches.
-fn token_response() -> hyper::http::response::Builder {
+pub(super) fn token_response() -> hyper::http::response::Builder {
     Response::builder()
         .header(header::REFERRER_POLICY, "no-referrer")
         .header(header::CACHE_CONTROL, "no-store")
@@ -387,7 +387,7 @@ fn auto_submit_page(return_url: &str, jwt: &str) -> Response {
 }
 
 /// Minimal HTML escaping for text interpolated into the auto-submit page.
-fn html_escape(s: &str) -> String {
+pub(super) fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

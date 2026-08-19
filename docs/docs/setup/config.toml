@@ -460,6 +460,16 @@
 # Default value: false
 #enabled = false
 
+# Secret enabling LTI Dynamic Registration. If set, an LMS admin can
+# register their platform by entering
+# `https://<your-tobira>/~lti/register?secret=<value>` as the
+# registration URL (Moodle: "Add LTI Advantage") — no manual copying of
+# IDs and URLs in either direction. Anyone who knows the secret can
+# register a platform that can then launch users into Tobira, so use a
+# long random value (e.g. `openssl rand -base64 24`) and rotate it by
+# changing this option. If unset, the registration endpoint is disabled.
+#registration_secret =
+
 # Path to the RSA private key (PEM-encoded PKCS#8) Tobira uses as its
 # LTI tool key, e.g. for signing Deep Linking responses. The public part
 # is served at `/~lti/jwks`. If not specified, a key is generated
