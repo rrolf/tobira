@@ -72,6 +72,11 @@ pub(super) async fn handle(req: Request<Incoming>, ctx: Arc<Context>) -> Respons
             register_req!(HttpReqCategory::Other);
             auth::lti::handle_launch(req, &ctx).await
         },
+        // The Deep Linking selection page confirms the teacher's pick here.
+        "/~lti/deep-link-confirm" if method == Method::POST => {
+            register_req!(HttpReqCategory::Other);
+            auth::lti::deeplink::handle_confirm(req, &ctx).await
+        },
 
         // From this point on, we only support GET and HEAD requests. All others
         // will result in 404.
@@ -167,6 +172,21 @@ pub(super) async fn handle(req: Request<Incoming>, ctx: Arc<Context>) -> Respons
         "/~lti/jwks" => {
             register_req!(HttpReqCategory::Other);
             auth::lti::handle_jwks(&ctx).await
+        }
+        // One-time handoff that opens the Deep Linking selection in its own
+        // window (the launch itself happens in an iframe, where the session
+        // cookie cannot be stored).
+        // GET only: a HEAD request (prefetcher, scanner) must not consume the
+        // one-time token.
+        "/~lti/select-window" if method == Method::GET => {
+            register_req!(HttpReqCategory::Other);
+            auth::lti::deeplink::handle_select_window(req, &ctx).await
+        }
+        // Consumes a finished Deep Linking selection and auto-POSTs the
+        // signed response back to the platform. GET only, like above.
+        "/~lti/deep-link-return" if method == Method::GET => {
+            register_req!(HttpReqCategory::Other);
+            auth::lti::deeplink::handle_return(req, &ctx).await
         }
 
         // Currently we just reply with our `index.html` to everything else.
