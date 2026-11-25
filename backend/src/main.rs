@@ -122,6 +122,10 @@ async fn run() -> Result<()> {
             let config = load_config_and_init_logger(shared, &args, "cli")?;
             cmd::known_groups::run(config, options).await?;
         }
+        Command::LtiRegistrations { options, shared } => {
+            let config = load_config_and_init_logger(shared, &args, "cli")?;
+            cmd::lti_registrations::run(config, options).await?;
+        }
         Command::KnownUsers { options, shared } => {
             let config = load_config_and_init_logger(shared, &args, "cli")?;
             cmd::known_users::run(config, options).await?;

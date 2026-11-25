@@ -21,7 +21,7 @@ use crate::{
 
 
 mod cache;
-mod config;
+pub(crate) mod config;
 mod handlers;
 pub mod lti;
 pub mod oidc;

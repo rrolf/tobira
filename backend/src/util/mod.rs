@@ -150,6 +150,20 @@ where
         .pipe(Ok)
 }
 
+/// Like [`download_body`], but aborts (while streaming, i.e. before buffering
+/// everything) once the body exceeds `limit` bytes. For responses from servers
+/// we do not fully trust.
+pub(crate) async fn download_body_limited<B>(body: B, limit: usize) -> Result<Bytes>
+where
+    B: hyper::body::Body,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    http_body_util::Limited::new(body, limit)
+        .collect().await
+        .map(|collected| collected.to_bytes())
+        .map_err(|e| anyhow!("failed to download HTTP body (too large?): {e}"))
+}
+
 pub fn basic_auth_header(user: &str, password: &str) -> SecretString {
     let credentials = format!("{user}:{password}");
     let encoded_credentials = base64::engine::general_purpose::STANDARD.encode(credentials);

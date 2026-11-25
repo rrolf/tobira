@@ -29,7 +29,6 @@ use crate::{
     auth::{
         HasRoles, SessionId, User, base64encode,
         cache::{DeepLinkSelection, DeepLinkState},
-        config::LtiPlatform,
     },
     db,
     http::{self, Context, Response},
@@ -83,7 +82,8 @@ pub(super) fn validated_settings(
 /// the state under a one-time token and redirects to the selection page.
 pub(super) async fn start_selection(
     settings: &DeepLinkingSettingsClaim,
-    platform: &LtiPlatform,
+    platform: &super::registration::ResolvedPlatform,
+    deployment_id: &str,
     session_cookie: &Cookie<'static>,
     ctx: &Context,
 ) -> Response {
@@ -93,7 +93,7 @@ pub(super) async fn start_selection(
         settings.data.clone(),
         platform.issuer.clone(),
         platform.client_id.clone(),
-        platform.deployment_id.clone(),
+        deployment_id.to_owned(),
         session_cookie.value().to_owned(),
         session_cookie.to_string(),
     );
@@ -113,7 +113,7 @@ pub(super) async fn start_selection(
 /// A response builder for responses that carry the Deep Linking token (in the
 /// `Location` URL or as page content): the token must not leak via `Referer`
 /// or shared caches.
-fn token_response() -> hyper::http::response::Builder {
+pub(super) fn token_response() -> hyper::http::response::Builder {
     Response::builder()
         .header(header::REFERRER_POLICY, "no-referrer")
         .header(header::CACHE_CONTROL, "no-store")
@@ -387,7 +387,7 @@ fn auto_submit_page(return_url: &str, jwt: &str) -> Response {
 }
 
 /// Minimal HTML escaping for text interpolated into the auto-submit page.
-fn html_escape(s: &str) -> String {
+pub(super) fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

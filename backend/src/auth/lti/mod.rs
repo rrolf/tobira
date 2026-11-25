@@ -14,10 +14,13 @@ use hyper::{Method, Request, StatusCode, Uri, body::Incoming, header};
 use secrecy::ExposeSecret;
 
 pub(crate) mod deeplink;
+pub(crate) mod registration;
+
+use registration::{DeploymentPolicy, resolve_platform};
 use serde::Deserialize;
 
 use crate::{
-    auth::{User, config::{LtiConfig, LtiPlatform, LtiUsernameSource}},
+    auth::{User, config::{LtiConfig, LtiUsernameSource}},
     http::{self, Context, Response},
     prelude::*,
     sync::client::AuthMode,
@@ -53,16 +56,16 @@ pub(crate) async fn handle_login(req: Request<Incoming>, ctx: &Context) -> Respo
         );
     };
 
-    // Resolve the platform. `client_id` is optional in the initiation request:
-    // match on (iss, client_id) if it is present, otherwise on the issuer alone.
-    let lti = &ctx.config.auth.lti;
-    let platform = match get("client_id") {
-        Some(client_id) => lti.find_platform(iss, client_id),
-        None => lti.find_platform_by_issuer(iss),
-    };
-    let Some(platform) = platform else {
-        warn!("LTI login for unknown platform (iss = '{iss}')");
-        return http::response::bad_request("LTI login: unknown platform");
+    // Resolve the platform (static config first, then dynamic registrations).
+    // `client_id` is optional in the initiation request: match on (iss,
+    // client_id) if it is present, otherwise on the issuer alone.
+    let platform = match resolve_platform(ctx, iss, get("client_id")).await {
+        Ok(Some(platform)) => platform,
+        Ok(None) => {
+            warn!("LTI login for unknown platform (iss = '{iss}')");
+            return http::response::bad_request("LTI login: unknown platform");
+        }
+        Err(response) => return response,
     };
 
     // Issue `state` + `nonce` and remember them for the launch to verify.
@@ -162,14 +165,18 @@ pub(crate) async fn handle_launch(req: Request<Incoming>, ctx: &Context) -> Resp
         warn!("LTI launch with unknown, expired or already-used 'state'");
         return http::response::bad_request("LTI launch: invalid or expired 'state'");
     };
-    let Some(platform) = ctx.config.auth.lti.find_platform(&login.issuer, &login.client_id) else {
-        // The platform was reconfigured away between login and launch.
-        error!("LTI launch: platform for issued state no longer configured");
-        return http::response::internal_server_error();
+    let platform = match resolve_platform(ctx, &login.issuer, Some(&login.client_id)).await {
+        Ok(Some(platform)) => platform,
+        Ok(None) => {
+            // The platform was removed between login and launch.
+            error!("LTI launch: platform for issued state no longer known");
+            return http::response::internal_server_error();
+        }
+        Err(response) => return response,
     };
 
     // ----- Verify the launch token against the platform's JWKS ------------------------------
-    let keys = match fetch_platform_jwks(platform, ctx).await {
+    let keys = match fetch_platform_jwks(&platform.keyset_url, ctx).await {
         Ok(keys) => keys,
         Err(e) => {
             warn!("LTI launch: could not fetch platform JWKS: {e:?}");
@@ -206,9 +213,37 @@ pub(crate) async fn handle_launch(req: Request<Incoming>, ctx: &Context) -> Resp
         warn!("LTI launch: nonce mismatch");
         return http::response::bad_request("LTI launch: nonce mismatch");
     }
-    if claims.deployment_id != platform.deployment_id {
-        warn!("LTI launch: deployment_id mismatch");
-        return http::response::bad_request("LTI launch: deployment_id mismatch");
+    match &platform.deployments {
+        // Configured platforms pin exactly one deployment ID.
+        DeploymentPolicy::Fixed(expected) => {
+            if claims.deployment_id != *expected {
+                warn!("LTI launch: deployment_id mismatch");
+                return http::response::bad_request("LTI launch: deployment_id mismatch");
+            }
+        }
+        // Dynamic registrations cover the whole platform; remember new
+        // deployments on first use (see `DeploymentPolicy` for the rationale).
+        DeploymentPolicy::TrustOnFirstUse { registration_id, known } => {
+            if !known.contains(&claims.deployment_id) {
+                info!(
+                    "LTI launch: new deployment '{}' of registered platform '{}'",
+                    claims.deployment_id, platform.issuer,
+                );
+                // Purely informational bookkeeping — don't fail the launch if
+                // the connection or the update fails.
+                let remembered = match crate::db::get_conn_or_service_unavailable(
+                    &ctx.db_pool,
+                ).await {
+                    Ok(db) => registration::remember_deployment(
+                        &db, *registration_id, &claims.deployment_id,
+                    ).await,
+                    Err(_) => Err(anyhow!("no DB connection")),
+                };
+                if let Err(e) = remembered {
+                    warn!("LTI launch: could not record deployment id: {e:#}");
+                }
+            }
+        }
     }
 
     debug!("LTI launch claims: {claims:#?}");
@@ -277,7 +312,13 @@ pub(crate) async fn handle_launch(req: Request<Incoming>, ctx: &Context) -> Resp
     // A Deep Linking launch continues into the selection flow instead of
     // landing on content.
     if let Some(settings) = deep_linking_settings {
-        return deeplink::start_selection(settings, platform, &cookie, ctx).await;
+        return deeplink::start_selection(
+            settings,
+            &platform,
+            &claims.deployment_id,
+            &cookie,
+            ctx,
+        ).await;
     }
 
     // Decide where to land; see `landing_target`. Both candidates are kept
@@ -349,15 +390,17 @@ fn resolve_username(claims: &LtiClaims, source: LtiUsernameSource) -> Option<Str
 /// Fetches and parses the platform's JWKS into verifying keys. Keys we do not
 /// understand are skipped.
 async fn fetch_platform_jwks(
-    platform: &LtiPlatform,
+    keyset_url: &crate::util::HttpUrl,
     ctx: &Context,
 ) -> Result<Vec<jwtea::VerifyingKey>> {
-    let uri = platform.keyset_url.as_str().parse::<Uri>().context("invalid keyset URL")?;
+    let uri = keyset_url.as_str().parse::<Uri>().context("invalid keyset URL")?;
     let response = ctx.http_client.get(uri).await?;
     if !response.status().is_success() {
         bail!("platform JWKS endpoint returned status {}", response.status());
     }
-    let body = download_body(response.into_body()).await?;
+    // Cap the response size: with Dynamic Registration, the keyset URL is not
+    // necessarily admin-configured anymore.
+    let body = crate::util::download_body_limited(response.into_body(), 256 * 1024).await?;
     let jwks: jwtea::Jwks = serde_json::from_slice(&body)
         .context("could not parse platform JWKS")?;
     Ok(jwks.to_verifying_keys().filter_map(|res| res.ok()).collect())
